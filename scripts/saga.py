@@ -17,7 +17,7 @@ from math import ceil, sqrt, exp, log
 # Data management
 from copy import deepcopy
 import re
-import pandas
+#import pandas
 
 # For HZ multivariate test, used in scipy.spatial.distance.mahalanobis
 from numpy import floor
