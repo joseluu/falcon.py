@@ -1,7 +1,53 @@
 """
 Compression and decompression routines for signatures.
 """
+from bitstring import Bits, BitArray # https://bitstring.readthedocs.io/en/stable/bits.html
 
+#pack https://stackoverflow.com/questions/5066119/how-to-pack-arbitrary-bit-sequence-in-python
+def pack_pk(pk_int_array):
+    b = BitArray().join(BitArray(uint=i, length=14) for i in pk_int_array)
+    return "09" + b.tobytes().hex()
+
+def unpack_pk(pk_hex):
+    if pk_hex[:2] != "09":
+        return "Error: invalid sk, should begin with 0x59"
+    s = Bits(bytes.fromhex(pk_hex[2:]))
+    r = []
+    i = 0
+    for packed in s.cut(14):
+        b = BitArray(packed)
+        r.append(b.uint)
+    return r
+
+
+def explode_raw_sk(n, raw_sk):
+    f = []
+    g = []
+    F = []
+    G = []
+    for i in range(n):
+        f.append(int(raw_sk[ i * 2 : i * 2 + 2], 16) - 128)
+        g.append(int(raw_sk[ (n+i) * 2 :  (n+i) * 2+2], 16) - 128)
+        F.append(int(raw_sk[  (2*n+i) * 2 : (2*n+i) * 2+2], 16) - 128)
+        if len(raw_sk) == 4 * n:
+            G.append(int(raw_sk[  (3*n+i) *2 : (3*n+i) * 2+2], 16) - 128)
+    return [f, g, F, G]
+
+# decoding bit packed buffer: https://stackoverflow.com/questions/39663/what-is-the-best-way-to-do-bit-field-manipulation-in-python
+def unpack_sk(sk_hex):
+    if sk_hex[:2] != "59":
+        return "Error: invalid sk, should begin with 0x59"
+    s = Bits(bytes.fromhex(sk_hex[2:]))
+    r = bytearray()
+    i=0
+    for packed in s.cut(6):
+        b = BitArray(packed)
+        if (b.startswith('0b1')): # negative
+            b.prepend('0b11')
+        else:
+            b.prepend('0b00')
+        r.append(b.int+128) # emulate naive encoder which adds 128
+    return r.hex()
 
 def compress(v, slen):
     """

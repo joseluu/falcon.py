@@ -8,8 +8,8 @@ from math import sqrt
 from fft import fft, ifft, sub, neg, add_fft, mul_fft
 from ntt import sub_zq, mul_zq, div_zq
 from ffsampling import gram, ffldl_fft, ffsampling_fft
-from ntrugen import ntru_gen
-from encoding import compress, decompress
+from ntrugen import ntru_gen, ntru_solve
+from encoding import compress, decompress, unpack_pk
 # https://pycryptodome.readthedocs.io/en/latest/src/hash/shake256.html
 from Crypto.Hash import SHAKE256
 # Randomness
@@ -180,18 +180,22 @@ def normalize_tree(tree, sigma):
         tree[1] = 0
 
 
+
 class PublicKey:
     """
     This class contains methods for performing public key operations in Falcon.
     """
 
-    def __init__(self, sk):
+    def __init__(self, sk=None, n=512, pk=None):
         """Initialize a public key."""
-        self.n = sk.n
-        self.h = sk.h
-        self.hash_to_point = sk.hash_to_point
-        self.signature_bound = sk.signature_bound
-        self.verify = sk.verify
+        if sk == None:
+            self.n = n
+            self.h = unpack_pk(pk)
+        else: # we have sk
+            self.n = sk.n
+            self.h = sk.h
+        self.signature_bound =  Params[n]["sig_bound"]
+        self.sig_bytelen = Params[n]["sig_bytelen"]
 
     def __repr__(self):
         """Print the object in readable form."""
@@ -199,6 +203,11 @@ class PublicKey:
         rep += "h = {h}\n".format(h=self.h)
         return rep
 
+    def verify(self, message, signature):
+        return verify_signature(self, message, signature)
+    
+    def hash_to_point(self, message, salt):
+        return hash_to_point_n(self.n, message, salt)
 
 class SecretKey:
     """
@@ -225,16 +234,26 @@ class SecretKey:
         self.signature_bound = Params[n]["sig_bound"]
         self.sig_bytelen = Params[n]["sig_bytelen"]
 
-        # Compute NTRU polynomials f, g, F, G verifying fG - gF = q mod Phi
+        f = []
+        g = []
+        F = []
+        G = []
         if polys is None:
+            # Compute NTRU polynomials f, g, F, G verifying fG - gF = q mod Phi
             self.f, self.g, self.F, self.G = ntru_gen(n)
+        elif len(polys) == 2:
+            [f, g] = polys
+        elif len(polys) == 3:
+            [f, g, F0] = polys
         else:
             [f, g, F, G] = polys
-            assert all((len(poly) == n) for poly in [f, g, F, G])
-            self.f = f[:]
-            self.g = g[:]
-            self.F = F[:]
-            self.G = G[:]
+        if len(G) == 0: # partial key
+            [F, G] = ntru_solve(f,g)
+        assert all((len(poly) == n) for poly in [f, g, F, G])
+        self.f = f[:]
+        self.g = g[:]
+        self.F = F[:]
+        self.G = G[:]
 
         # From f, g, F, G, compute the basis B0 of a NTRU lattice
         # as well as its Gram matrix and their fft's.
@@ -262,35 +281,22 @@ class SecretKey:
             rep += "\nFFT tree\n"
             rep += print_tree(self.T_fft, pref="")
         return rep
+    
+    def to_bytes(self):
+        bytes_arr = bytearray()
+        for b in self.f:
+            bytes_arr.append(b+128)
+        for b in self.g:
+            bytes_arr.append(b+128)
+        for b in self.F:
+            bytes_arr.append(b+128)
+        for b in self.G:
+            bytes_arr.append(b+128)
+        return bytes(bytes_arr)
 
     def hash_to_point(self, message, salt):
-        """
-        Hash a message to a point in Z[x] mod(Phi, q).
-        Inspired by the Parse function from NewHope.
-        """
-        n = self.n
-        if q > (1 << 16):
-            raise ValueError("The modulus is too large")
+        return hash_to_point_n(self.n, message, salt)
 
-        k = (1 << 16) // q
-        # Create a SHAKE object and hash the salt and message.
-        shake = SHAKE256.new()
-        shake.update(salt)
-        shake.update(message)
-        # Output pseudorandom bytes and map them to coefficients.
-        hashed = [0 for i in range(n)]
-        i = 0
-        j = 0
-        while i < n:
-            # Takes 2 bytes, transform them in a 16 bits integer
-            twobytes = shake.read(2)
-            elt = (twobytes[0] << 8) + twobytes[1]  # This breaks in Python 2.x
-            # Implicit rejection sampling
-            if elt < k * q:
-                hashed[i] = elt % q
-                i += 1
-            j += 1
-        return hashed
 
     def sample_preimage(self, point, seed=None):
         """
@@ -361,30 +367,61 @@ class SecretKey:
                     return header + salt + enc_s
 
     def verify(self, message, signature):
-        """
-        Verify a signature.
-        """
-        # Unpack the salt and the short polynomial s1
-        salt = signature[HEAD_LEN:HEAD_LEN + SALT_LEN]
-        enc_s = signature[HEAD_LEN + SALT_LEN:]
-        s1 = decompress(enc_s, self.sig_bytelen - HEAD_LEN - SALT_LEN, self.n)
+        return verify_signature(self, message, signature)
 
-        # Check that the encoding is valid
-        if (s1 is False):
-            print("Invalid encoding")
-            return False
+def hash_to_point_n(n, message, salt):
+    """
+    Hash a message to a point in Z[x] mod(Phi, q).
+    Inspired by the Parse function from NewHope.
+    """
+    if q > (1 << 16):
+        raise ValueError("The modulus is too large")
 
-        # Compute s0 and normalize its coefficients in (-q/2, q/2]
-        hashed = self.hash_to_point(message, salt)
-        s0 = sub_zq(hashed, mul_zq(s1, self.h))
-        s0 = [(coef + (q >> 1)) % q - (q >> 1) for coef in s0]
+    k = (1 << 16) // q
+    # Create a SHAKE object and hash the salt and message.
+    shake = SHAKE256.new()
+    shake.update(salt)
+    shake.update(message)
+    # Output pseudorandom bytes and map them to coefficients.
+    hashed = [0 for i in range(n)]
+    i = 0
+    j = 0
+    while i < n:
+        # Takes 2 bytes, transform them in a 16 bits integer
+        twobytes = shake.read(2)
+        elt = (twobytes[0] << 8) + twobytes[1]  # This breaks in Python 2.x
+        # Implicit rejection sampling
+        if elt < k * q:
+            hashed[i] = elt % q
+            i += 1
+        j += 1
+    return hashed
+    
+def verify_signature(key, message, signature):
+    """
+    Verify a signature.
+    """
+    # Unpack the salt and the short polynomial s1
+    salt = signature[HEAD_LEN:HEAD_LEN + SALT_LEN]
+    enc_s = signature[HEAD_LEN + SALT_LEN:]
+    s1 = decompress(enc_s, key.sig_bytelen - HEAD_LEN - SALT_LEN, key.n)
 
-        # Check that the (s0, s1) is short
-        norm_sign = sum(coef ** 2 for coef in s0)
-        norm_sign += sum(coef ** 2 for coef in s1)
-        if norm_sign > self.signature_bound:
-            print("Squared norm of signature is too large:", norm_sign)
-            return False
+    # Check that the encoding is valid
+    if (s1 is False):
+        print("Invalid encoding")
+        return False
 
-        # If all checks are passed, accept
-        return True
+    # Compute s0 and normalize its coefficients in (-q/2, q/2]
+    hashed = key.hash_to_point(message, salt)
+    s0 = sub_zq(hashed, mul_zq(s1, key.h))
+    s0 = [(coef + (q >> 1)) % q - (q >> 1) for coef in s0]
+
+    # Check that the (s0, s1) is short
+    norm_sign = sum(coef ** 2 for coef in s0)
+    norm_sign += sum(coef ** 2 for coef in s1)
+    if norm_sign > key.signature_bound:
+        print("Squared norm of signature is too large:", norm_sign)
+        return False
+
+    # If all checks are passed, accept
+    return True
